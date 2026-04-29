@@ -1,246 +1,346 @@
-/**
- * SABACC GAME ENGINE
- * Based on the Corellian Spike variant (as seen in Solo: A Star Wars Story)
- *
- * Deck: 62 cards — two suits (Circles & Squares), each numbered 1-10, plus
- * special single-copy cards (Sylop = 0, The Idiot = 0, and special cards).
- * Also includes 2 Sylop cards (wild/zero cards).
- *
- * Goal: Get as close to 0 as possible without going bust.
- * Positive and negative cards exist. Pure Sabacc (two Sylops) = automatic win.
- * Sabacc = exactly 0. Closest to 0 wins; ties go to fewest cards.
- */
+const {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require('discord.js');
 
-const SUITS = ['⭕', '🔷'];
-const SPECIAL_CARDS = [
-  { name: 'The Idiot', value: 0, id: 'idiot' },
-  { name: 'Sylop', value: 0, id: 'sylop1' },
-  { name: 'Sylop', value: 0, id: 'sylop2' },
-];
+const sabacc = require('../games/sabacc');
 
-function buildDeck() {
-  const deck = [];
-  for (const suit of SUITS) {
-    for (let v = 1; v <= 10; v++) {
-      // Positive cards
-      deck.push({ name: `${suit} ${v}`, value: v, suit, id: `${suit}+${v}` });
-      // Negative cards
-      deck.push({ name: `${suit} -${v}`, value: -v, suit, id: `${suit}-${v}` });
-    }
-  }
-  for (const s of SPECIAL_CARDS) {
-    deck.push({ ...s });
-  }
-  return deck;
-}
+// Pending discard selections: Map<userId, { state, cardIndex }>
+const pendingDiscard = new Map();
 
-function shuffle(deck) {
-  const d = [...deck];
-  for (let i = d.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [d[i], d[j]] = [d[j], d[i]];
-  }
-  return d;
-}
+const SABACC_COLOR = 0x1a1a2e;
+const SABACC_ACCENT = 0xffd700;
 
-function handTotal(hand) {
-  return hand.reduce((s, c) => s + c.value, 0);
-}
-
-function handDisplay(hand) {
-  return hand.map(c => `\`${c.name}\``).join(' ');
-}
-
-function scoreHand(hand) {
-  const total = handTotal(hand);
-  const isPureSabacc = hand.length === 2 && hand.every(c => c.id?.startsWith('sylop'));
-  return { total, isPureSabacc, cards: hand.length };
-}
-
-function compareHands(handA, handB) {
-  const a = scoreHand(handA);
-  const b = scoreHand(handB);
-  if (a.isPureSabacc && !b.isPureSabacc) return 1;  // A wins
-  if (!a.isPureSabacc && b.isPureSabacc) return -1; // B wins
-  if (Math.abs(a.total) < Math.abs(b.total)) return 1;
-  if (Math.abs(a.total) > Math.abs(b.total)) return -1;
-  // Tie-break: fewer cards
-  if (a.cards < b.cards) return 1;
-  if (a.cards > b.cards) return -1;
-  return 0; // Exact tie
-}
-
-// Active games: Map<channelId, GameState>
-const games = new Map();
-
-function getGame(channelId) {
-  return games.get(channelId) || null;
-}
-
-function startGame(channelId, hostId, hostName, bet = 100) {
-  if (games.has(channelId)) return null;
-  const deck = shuffle(buildDeck());
-  const state = {
-    channelId,
-    bet,
-    pot: 0,
-    deck,
-    discardPile: [],
-    players: [],
-    hostId,
-    phase: 'joining', // joining → betting → playing → showdown
-    currentTurn: 0,
-    round: 1,
-    maxRounds: 3,
-    jeopardyRoll: false,
-  };
-  // Add host immediately
-  addPlayer(state, hostId, hostName);
-  games.set(channelId, state);
-  return state;
-}
-
-function addPlayer(state, userId, username) {
-  if (state.players.find(p => p.id === userId)) return false;
-  if (state.phase !== 'joining') return false;
-  state.players.push({
-    id: userId,
-    username,
-    hand: [],
-    credits: 1000,
-    bet: 0,
-    folded: false,
-    standing: false,
-  });
-  return true;
-}
-
-function dealInitialCards(state) {
-  for (const player of state.players) {
-    player.hand = [state.deck.pop(), state.deck.pop()];
-    player.bet = state.bet;
-    player.credits -= state.bet;
-    state.pot += state.bet;
-  }
-  state.phase = 'playing';
-  state.currentTurn = 0;
-}
-
-function drawFromDeck(state, playerId) {
-  const player = state.players.find(p => p.id === playerId);
-  if (!player || state.deck.length === 0) return null;
-  const card = state.deck.pop();
-  player.hand.push(card);
-  return card;
-}
-
-function drawFromDiscard(state, playerId) {
-  const player = state.players.find(p => p.id === playerId);
-  if (!player || state.discardPile.length === 0) return null;
-  const card = state.discardPile.pop();
-  player.hand.push(card);
-  return card;
-}
-
-function discardCard(state, playerId, cardIndex) {
-  const player = state.players.find(p => p.id === playerId);
-  if (!player || cardIndex < 0 || cardIndex >= player.hand.length) return null;
-  const [card] = player.hand.splice(cardIndex, 1);
-  state.discardPile.push(card);
-  return card;
-}
-
-function standPlayer(state, playerId) {
-  const player = state.players.find(p => p.id === playerId);
-  if (!player) return false;
-  player.standing = true;
-  return true;
-}
-
-function foldPlayer(state, playerId) {
-  const player = state.players.find(p => p.id === playerId);
-  if (!player) return false;
-  player.folded = true;
-  return true;
-}
-
-function getCurrentPlayer(state) {
-  const active = state.players.filter(p => !p.folded && !p.standing);
-  if (active.length === 0) return null;
-  return state.players[state.currentTurn % state.players.length];
-}
-
-function advanceTurn(state) {
-  const total = state.players.length;
-  let tries = 0;
-  do {
-    state.currentTurn = (state.currentTurn + 1) % total;
-    tries++;
-    if (tries > total) return false; // All done
-  } while (state.players[state.currentTurn].folded || state.players[state.currentTurn].standing);
-  return true;
-}
-
-function isRoundOver(state) {
-  return state.players.every(p => p.folded || p.standing);
-}
-
-function resolveGame(state) {
-  const active = state.players.filter(p => !p.folded);
-  if (active.length === 0) return { winners: [], pot: state.pot };
-
-  // Find best hand
-  let best = active[0];
-  let winners = [best];
-  for (let i = 1; i < active.length; i++) {
-    const result = compareHands(active[i].hand, best.hand);
-    if (result === 1) { best = active[i]; winners = [active[i]]; }
-    else if (result === 0) { winners.push(active[i]); }
-  }
-
-  // Check for Jeopardy (busted = over 23 or under -23? No — in Corellian Spike, bomb out = exactly ±23... actually nannies = over with 23 total)
-  // Simpler: if winner total is not 0, everyone pays Jeopardy (they owe extra if sum ≠ 0)
-  const winnerScore = scoreHand(winners[0].hand);
-  const perWinner = Math.floor(state.pot / winners.length);
-  winners.forEach(w => { w.credits += perWinner; });
-
-  state.phase = 'ended';
-  return { winners, pot: state.pot, winnerScore };
-}
-
-function endGame(channelId) {
-  games.delete(channelId);
-}
-
-function formatGameState(state, forPlayerId = null) {
-  const lines = [];
-  lines.push(`**🃏 SABACC — Round ${state.round}/${state.maxRounds}**`);
-  lines.push(`💰 Pot: **${state.pot} credits**  |  Phase: **${state.phase}**`);
-  lines.push('');
-
-  for (const p of state.players) {
-    const status = p.folded ? '🏳️ folded' : p.standing ? '🛑 standing' : '🎮 active';
-    if (forPlayerId && p.id === forPlayerId) {
-      const total = handTotal(p.hand);
-      lines.push(`${status} **${p.username}** — Hand: ${handDisplay(p.hand)} = **${total}**  |  ${p.credits} credits`);
-    } else {
-      lines.push(`${status} **${p.username}** — 🂠 ${p.hand.length} cards  |  ${p.credits} credits`);
-    }
-  }
-
-  if (state.discardPile.length > 0) {
-    const top = state.discardPile[state.discardPile.length - 1];
-    lines.push(`\n🗑️ Discard top: \`${top.name}\``);
-  }
-
-  return lines.join('\n');
+function sabaccEmbed(title, description, color = SABACC_COLOR) {
+  return new EmbedBuilder()
+    .setTitle(`🃏 ${title}`)
+    .setDescription(description)
+    .setColor(color)
+    .setFooter({ text: 'Sabacc — Corellian Spike Variant' });
 }
 
 module.exports = {
-  startGame, addPlayer, dealInitialCards,
-  drawFromDeck, drawFromDiscard, discardCard,
-  standPlayer, foldPlayer, advanceTurn,
-  getCurrentPlayer, isRoundOver, resolveGame,
-  endGame, getGame, formatGameState,
-  handTotal, handDisplay, scoreHand,
+  data: new SlashCommandBuilder()
+    .setName('sabacc')
+    .setDescription('Play Sabacc — the galaxy\'s favourite card game')
+    .addSubcommand(sub =>
+      sub.setName('start')
+        .setDescription('Start a new Sabacc game in this channel')
+        .addIntegerOption(opt =>
+          opt.setName('bet')
+            .setDescription('Credits per player (default: 100)')
+            .setMinValue(10).setMaxValue(10000)))
+    .addSubcommand(sub =>
+      sub.setName('join')
+        .setDescription('Join the current Sabacc game'))
+    .addSubcommand(sub =>
+      sub.setName('deal')
+        .setDescription('Deal cards and start the game (host only)'))
+    .addSubcommand(sub =>
+      sub.setName('hand')
+        .setDescription('View your hand (private)'))
+    .addSubcommand(sub =>
+      sub.setName('draw')
+        .setDescription('Draw a card from the deck'))
+    .addSubcommand(sub =>
+      sub.setName('draw-discard')
+        .setDescription('Draw from the discard pile'))
+    .addSubcommand(sub =>
+      sub.setName('discard')
+        .setDescription('Discard a card from your hand')
+        .addIntegerOption(opt =>
+          opt.setName('position')
+            .setDescription('Card position in hand (1, 2, 3...)')
+            .setRequired(true).setMinValue(1).setMaxValue(10)))
+    .addSubcommand(sub =>
+      sub.setName('stand')
+        .setDescription('Stand — lock in your current hand'))
+    .addSubcommand(sub =>
+      sub.setName('fold')
+        .setDescription('Fold — leave the current round'))
+    .addSubcommand(sub =>
+      sub.setName('status')
+        .setDescription('Show the current game status'))
+    .addSubcommand(sub =>
+      sub.setName('showdown')
+        .setDescription('Force showdown — reveal all hands (host only)'))
+    .addSubcommand(sub =>
+      sub.setName('end')
+        .setDescription('End the current game (host only)')),
+
+  async execute(interaction) {
+    const sub = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
+
+    // ── START ──────────────────────────────────────────────────────────────
+    if (sub === 'start') {
+      const existing = sabacc.getGame(channelId);
+      if (existing) {
+        return interaction.reply({ embeds: [sabaccEmbed('Game Already Running', 'A Sabacc game is already in progress here. Use `/sabacc join` to join it!', 0xe74c3c)], ephemeral: true });
+      }
+      const bet = interaction.options.getInteger('bet') || 100;
+      const state = sabacc.startGame(channelId, userId, username, bet);
+      if (!state) return interaction.reply({ content: 'Failed to start game.', ephemeral: true });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('sabacc_join').setLabel('Join Game').setStyle(ButtonStyle.Primary).setEmoji('🃏'),
+        new ButtonBuilder().setCustomId('sabacc_deal').setLabel('Deal Cards').setStyle(ButtonStyle.Success).setEmoji('🎴'),
+      );
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          'Sabacc Game Starting!',
+          `**${username}** is hosting a game of Sabacc!\n\n` +
+          `💰 Ante: **${bet} credits** per player\n` +
+          `👥 Players: **${username}**\n\n` +
+          `Click **Join Game** to join, then the host clicks **Deal Cards** to start!`,
+          SABACC_ACCENT,
+        )],
+        components: [row],
+      });
+    }
+
+    // ── JOIN ───────────────────────────────────────────────────────────────
+    if (sub === 'join') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ embeds: [sabaccEmbed('No Game', 'No Sabacc game running. Start one with `/sabacc start`!', 0xe74c3c)], ephemeral: true });
+      if (state.phase !== 'joining') return interaction.reply({ embeds: [sabaccEmbed('Too Late', 'Cards have already been dealt.', 0xe74c3c)], ephemeral: true });
+
+      const joined = sabacc.addPlayer(state, userId, username);
+      if (!joined) return interaction.reply({ embeds: [sabaccEmbed('Already In', 'You\'re already in this game!', 0xe74c3c)], ephemeral: true });
+
+      const names = state.players.map(p => `• ${p.username}`).join('\n');
+      return interaction.reply({
+        embeds: [sabaccEmbed('Player Joined!', `**${username}** joined the game!\n\n**Players (${state.players.length}):**\n${names}`, SABACC_ACCENT)],
+      });
+    }
+
+    // ── DEAL ───────────────────────────────────────────────────────────────
+    if (sub === 'deal') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ content: 'No game running.', ephemeral: true });
+      if (state.hostId !== userId) return interaction.reply({ content: 'Only the host can deal!', ephemeral: true });
+      if (state.phase !== 'joining') return interaction.reply({ content: 'Cards already dealt.', ephemeral: true });
+      if (state.players.length < 2) return interaction.reply({ content: 'Need at least 2 players to start!', ephemeral: true });
+
+      sabacc.dealInitialCards(state);
+      const names = state.players.map(p => `• ${p.username} (${p.credits} credits)`).join('\n');
+      const current = sabacc.getCurrentPlayer(state);
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          'Cards Dealt!',
+          `Cards have been dealt! Each player has 2 cards.\n\n**Players:**\n${names}\n\n` +
+          `🎮 First turn: **${current?.username}**\n\n` +
+          `Use \`/sabacc hand\` to see your cards (private).\nOn your turn: \`draw\`, \`draw-discard\`, \`discard\`, \`stand\`, or \`fold\`.`,
+          SABACC_ACCENT,
+        )],
+      });
+    }
+
+    // ── HAND ───────────────────────────────────────────────────────────────
+    if (sub === 'hand') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ content: 'No game running.', ephemeral: true });
+      const player = state.players.find(p => p.id === userId);
+      if (!player) return interaction.reply({ content: 'You\'re not in this game!', ephemeral: true });
+
+      const total = sabacc.handTotal(player.hand);
+      const display = sabacc.handDisplay(player.hand);
+      const status = player.folded ? '🏳️ Folded' : player.standing ? '🛑 Standing' : '🎮 Active';
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          'Your Hand',
+          `${status}\n\n**Cards:** ${display}\n**Total:** \`${total}\`\n**Credits:** ${player.credits}\n\n` +
+          `🎯 Goal: Get as close to **0** as possible!`,
+          SABACC_COLOR,
+        )],
+        ephemeral: true,
+      });
+    }
+
+    // ── DRAW ───────────────────────────────────────────────────────────────
+    if (sub === 'draw') {
+      const state = sabacc.getGame(channelId);
+      if (!state || state.phase !== 'playing') return interaction.reply({ content: 'No active game.', ephemeral: true });
+
+      const current = sabacc.getCurrentPlayer(state);
+      if (!current || current.id !== userId) {
+        return interaction.reply({ embeds: [sabaccEmbed('Not Your Turn', `It\'s **${current?.username || '?'}**\'s turn!`, 0xe74c3c)], ephemeral: true });
+      }
+
+      const card = sabacc.drawFromDeck(state, userId);
+      if (!card) return interaction.reply({ content: 'Deck is empty!', ephemeral: true });
+
+      const total = sabacc.handTotal(current.hand);
+      const display = sabacc.handDisplay(current.hand);
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          `${username} Drew a Card`,
+          `Drew: \`${card.name}\`\n\n**Hand:** ${display}\n**Total:** \`${total}\`\n\n` +
+          `You may: \`/sabacc discard\`, \`/sabacc stand\`, or \`/sabacc fold\``,
+          SABACC_ACCENT,
+        )],
+      });
+    }
+
+    // ── DRAW-DISCARD ───────────────────────────────────────────────────────
+    if (sub === 'draw-discard') {
+      const state = sabacc.getGame(channelId);
+      if (!state || state.phase !== 'playing') return interaction.reply({ content: 'No active game.', ephemeral: true });
+      const current = sabacc.getCurrentPlayer(state);
+      if (!current || current.id !== userId) return interaction.reply({ content: 'Not your turn!', ephemeral: true });
+
+      if (state.discardPile.length === 0) return interaction.reply({ content: 'Discard pile is empty!', ephemeral: true });
+
+      const card = sabacc.drawFromDiscard(state, userId);
+      const total = sabacc.handTotal(current.hand);
+      const display = sabacc.handDisplay(current.hand);
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          `${username} Drew from Discard`,
+          `Drew: \`${card.name}\`\n\n**Hand:** ${display}\n**Total:** \`${total}\``,
+          SABACC_ACCENT,
+        )],
+      });
+    }
+
+    // ── DISCARD ────────────────────────────────────────────────────────────
+    if (sub === 'discard') {
+      const state = sabacc.getGame(channelId);
+      if (!state || state.phase !== 'playing') return interaction.reply({ content: 'No active game.', ephemeral: true });
+      const current = sabacc.getCurrentPlayer(state);
+      if (!current || current.id !== userId) return interaction.reply({ content: 'Not your turn!', ephemeral: true });
+
+      const pos = interaction.options.getInteger('position') - 1;
+      if (pos < 0 || pos >= current.hand.length) return interaction.reply({ content: `Invalid position. You have ${current.hand.length} cards.`, ephemeral: true });
+
+      const card = sabacc.discardCard(state, userId, pos);
+      sabacc.advanceTurn(state);
+      const nextPlayer = sabacc.getCurrentPlayer(state);
+
+      return interaction.reply({
+        embeds: [sabaccEmbed(
+          `${username} Discarded`,
+          `Discarded: \`${card.name}\`\n\n🎮 Next turn: **${nextPlayer?.username || 'nobody'}**`,
+          SABACC_ACCENT,
+        )],
+      });
+    }
+
+    // ── STAND ──────────────────────────────────────────────────────────────
+    if (sub === 'stand') {
+      const state = sabacc.getGame(channelId);
+      if (!state || state.phase !== 'playing') return interaction.reply({ content: 'No active game.', ephemeral: true });
+      const current = sabacc.getCurrentPlayer(state);
+      if (!current || current.id !== userId) return interaction.reply({ content: 'Not your turn!', ephemeral: true });
+
+      sabacc.standPlayer(state, userId);
+      sabacc.advanceTurn(state);
+
+      if (sabacc.isRoundOver(state)) {
+        const result = sabacc.resolveGame(state);
+        const winLines = result.winners.map(w => {
+          const sc = sabacc.scoreHand(w.hand);
+          const handStr = sabacc.handDisplay(w.hand);
+          return `🏆 **${w.username}** — ${handStr} = **${sc.total}**${sc.isPureSabacc ? ' ⭐ PURE SABACC!' : ''}`;
+        }).join('\n');
+
+        const allLines = state.players.map(p => {
+          const sc = sabacc.scoreHand(p.hand);
+          const folded = p.folded ? ' _(folded)_' : '';
+          return `• **${p.username}**: ${sabacc.handDisplay(p.hand)} = \`${sc.total}\`${folded}`;
+        }).join('\n');
+
+        sabacc.endGame(channelId);
+        return interaction.reply({
+          embeds: [sabaccEmbed(
+            'SHOWDOWN!',
+            `All players have stood.\n\n**Hands:**\n${allLines}\n\n${winLines}\n\n💰 Pot: **${result.pot} credits**`,
+            0xffd700,
+          )],
+        });
+      }
+
+      const next = sabacc.getCurrentPlayer(state);
+      return interaction.reply({
+        embeds: [sabaccEmbed(`${username} Stands`, `**${username}** is standing!\n\n🎮 Next turn: **${next?.username || 'showdown soon'}**`, SABACC_ACCENT)],
+      });
+    }
+
+    // ── FOLD ───────────────────────────────────────────────────────────────
+    if (sub === 'fold') {
+      const state = sabacc.getGame(channelId);
+      if (!state || state.phase !== 'playing') return interaction.reply({ content: 'No active game.', ephemeral: true });
+
+      sabacc.foldPlayer(state, userId);
+
+      const activePlayers = state.players.filter(p => !p.folded);
+      if (activePlayers.length === 1) {
+        const winner = activePlayers[0];
+        winner.credits += state.pot;
+        sabacc.endGame(channelId);
+        return interaction.reply({
+          embeds: [sabaccEmbed('Game Over', `**${username}** folded!\n\n🏆 **${winner.username}** wins by default! +${state.pot} credits`, 0xffd700)],
+        });
+      }
+
+      sabacc.advanceTurn(state);
+      const next = sabacc.getCurrentPlayer(state);
+      return interaction.reply({
+        embeds: [sabaccEmbed(`${username} Folded`, `**${username}** has folded.\n\n🎮 Next turn: **${next?.username || '?'}**`, SABACC_COLOR)],
+      });
+    }
+
+    // ── STATUS ─────────────────────────────────────────────────────────────
+    if (sub === 'status') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ content: 'No game running. Start with `/sabacc start`!', ephemeral: true });
+      const current = sabacc.getCurrentPlayer(state);
+      const status = sabacc.formatGameState(state, userId);
+      return interaction.reply({
+        embeds: [sabaccEmbed('Game Status', status + (current ? `\n\n🎮 Current turn: **${current.username}**` : ''), SABACC_COLOR)],
+        ephemeral: true,
+      });
+    }
+
+    // ── SHOWDOWN ───────────────────────────────────────────────────────────
+    if (sub === 'showdown') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ content: 'No game running.', ephemeral: true });
+      if (state.hostId !== userId) return interaction.reply({ content: 'Only the host can force a showdown!', ephemeral: true });
+
+      const result = sabacc.resolveGame(state);
+      const allLines = state.players.map(p => {
+        const sc = sabacc.scoreHand(p.hand);
+        return `• **${p.username}**: ${sabacc.handDisplay(p.hand)} = \`${sc.total}\`${p.folded ? ' _(folded)_' : ''}`;
+      }).join('\n');
+      const winLines = result.winners.map(w => {
+        const sc = sabacc.scoreHand(w.hand);
+        return `🏆 **${w.username}** — total: \`${sc.total}\`${sc.isPureSabacc ? ' ⭐ PURE SABACC!' : ''}`;
+      }).join('\n');
+
+      sabacc.endGame(channelId);
+      return interaction.reply({
+        embeds: [sabaccEmbed('Forced Showdown!', `**All Hands:**\n${allLines}\n\n${winLines}\n\n💰 Pot: **${result.pot} credits**`, 0xffd700)],
+      });
+    }
+
+    // ── END ────────────────────────────────────────────────────────────────
+    if (sub === 'end') {
+      const state = sabacc.getGame(channelId);
+      if (!state) return interaction.reply({ content: 'No game running.', ephemeral: true });
+      if (state.hostId !== userId) return interaction.reply({ content: 'Only the host can end the game!', ephemeral: true });
+      sabacc.endGame(channelId);
+      return interaction.reply({ embeds: [sabaccEmbed('Game Ended', 'The Sabacc game has been ended by the host.', 0xe74c3c)] });
+    }
+  },
 };
